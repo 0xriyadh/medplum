@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb for Medplum development: Node 24, npm from packageManager,
+# PostgreSQL and Valkey configured like docker-compose.yml, and npm dependencies.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+step() {
+  local name="$1"
+  shift
+  local start=$SECONDS
+  echo "==> $name"
+  "$@"
+  echo "<== $name ($((SECONDS - start))s)"
+}
+
+# package.json engines allow Node 22 or 24; the orb image ships a newer Node.
+NODE_VERSION=24.22.3
+node_dir="$HOME/.local/node24"
+
+install_node() {
+  if [[ "$("$node_dir/bin/node" --version 2>/dev/null)" == "v$NODE_VERSION" ]]; then
+    return
+  fi
+  local tmp
+  tmp="$(mktemp -d)"
+  curl -fsSL "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-x64.tar.xz" \
+    | tar -xJ -C "$tmp" --strip-components=1
+  rm -rf "$node_dir"
+  mkdir -p "$(dirname "$node_dir")"
+  mv "$tmp" "$node_dir"
+}
+
+persist_node_path() {
+  local marker="# medplum: Node 24 toolchain"
+  if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+    printf '\n%s\nexport PATH="%s/bin:$PATH"\n' "$marker" "$node_dir" >> "$HOME/.bash_profile"
+  fi
+}
+
+install_npm() {
+  local want
+  want="$(node -p "require('./package.json').packageManager.split('@')[1].split('+')[0]")"
+  if [[ "$(npm --version)" != "$want" ]]; then
+    npm install -g --no-fund --no-audit "npm@$want"
+  fi
+}
+
+install_system_packages() {
+  local missing=()
+  for pkg in postgresql valkey-server; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  if ((${#missing[@]})); then
+    sudo apt-get update
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+  fi
+}
+
+configure_postgres() {
+  local pg_version conf_dir conf
+  pg_version="$(ls /etc/postgresql | sort -V | tail -1)"
+  conf_dir="/etc/postgresql/$pg_version/main/conf.d"
+  conf="$(
+    cat <<'EOF'
+# Medplum settings from postgres/postgres.conf, tuned for speed over durability.
+listen_addresses = 'localhost'
+statement_timeout = 60000
+default_transaction_isolation = 'REPEATABLE READ'
+shared_preload_libraries = 'pg_stat_statements,auto_explain'
+fsync = off
+synchronous_commit = off
+full_page_writes = off
+EOF
+  )"
+  if [[ "$(sudo cat "$conf_dir/medplum.conf" 2>/dev/null)" != "$conf" ]]; then
+    echo "$conf" | sudo tee "$conf_dir/medplum.conf" >/dev/null
+    sudo systemctl enable postgresql
+    sudo systemctl restart postgresql
+  else
+    sudo systemctl enable --now postgresql
+  fi
+  for _ in $(seq 30); do
+    pg_isready -q -h localhost && break
+    sleep 1
+  done
+
+  # Same role and database as the postgres service in docker-compose.yml.
+  sudo -u postgres psql -v ON_ERROR_STOP=1 -q <<'EOF'
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'medplum') THEN
+    CREATE ROLE medplum LOGIN SUPERUSER PASSWORD 'medplum';
+  END IF;
+END
+$$;
+SELECT 'CREATE DATABASE medplum OWNER medplum'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'medplum')\gexec
+EOF
+  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'medplum_test'" | grep -q 1; then
+    PGPASSWORD=medplum psql -h localhost -U medplum -d medplum -q -f postgres/init_test.sql
+  fi
+}
+
+configure_valkey() {
+  local conf=/etc/valkey/valkey.conf marker="# medplum settings"
+  if ! sudo grep -Fqx "$marker" "$conf"; then
+    printf '\n%s\nrequirepass medplum\nsave ""\nappendonly no\n' "$marker" | sudo tee -a "$conf" >/dev/null
+    sudo systemctl enable valkey-server
+    sudo systemctl restart valkey-server
+  else
+    sudo systemctl enable --now valkey-server
+  fi
+}
+
+step "Install Node $NODE_VERSION" install_node
+persist_node_path
+export PATH="$node_dir/bin:$PATH"
+step "Install npm from packageManager" install_npm
+step "Install PostgreSQL and Valkey" install_system_packages
+step "Configure PostgreSQL" configure_postgres
+step "Configure Valkey" configure_valkey
+
+# npm ci always deletes node_modules, so skip it when a restored snapshot already
+# installed this lockfile with this Node and npm. npm ci removes the marker itself.
+deps_marker=node_modules/.orb-setup-deps
+deps_fingerprint="$(node --version) $(npm --version) $(sha256sum package-lock.json | cut -d' ' -f1)"
+if [[ "$(cat "$deps_marker" 2>/dev/null)" != "$deps_fingerprint" ]]; then
+  step "npm ci" npm ci --no-fund --no-audit
+  echo "$deps_fingerprint" > "$deps_marker"
+fi

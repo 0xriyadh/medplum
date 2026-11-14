@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Makes sure the PostgreSQL and Valkey services from .agents/setup are running after a wake.
+set -euo pipefail
+
+sudo systemctl start postgresql valkey-server
